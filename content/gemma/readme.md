@@ -10,17 +10,9 @@ Gemma3的模型结构如下图所示：
 ## 1. 构建 RMS 层
 
 Gemma3 使用 **RMSNorm**（均方根标准化）。LayerNorm 需要计算均值和标准差，计算量较大，且涉及减法操作，可能影响数值稳定性。RMSNorm 省略了均值计算，仅使用 均方根（RMS, Root Mean Square） 归一化：
-$$
-\text{rms}(x) = \sqrt{ \frac{1}{d} \sum_{i=1}^{d} x_i^2 }
-$$
-
-$$
-\hat{x} = \frac{x}{\text{rms}(x) + \epsilon}
-$$
-
-$$
-y = \gamma \hat{x}
-$$
+$rms(x) = \sqrt{ \frac{1}{d} \sum_{i=1}^{d} x_i^2 }$  ，
+$\hat{x} = \frac{x}{rms(x) + \epsilon}$  ，
+$y = \gamma \hat{x}$。
 与传统实现不同，Gemma3 将缩放因子从 γ 改为 1 + γ，其中 γ 初始化为 0。这种设计使得初始状态下的标准化操作更加稳定，有助于模型训练过程中的收敛性和数值稳定性。
 ``` python
 class RMSNorm(nn.Module):
@@ -43,27 +35,31 @@ class RMSNorm(nn.Module):
         out = x_norm * (1.0 + self.scale.float())  # 应用缩放：(1 + scale) * 归一化结果，scale初始为0
         
         if self.shift is not None:
-            out = out + self.shift.float()  # 如果启用了偏置，加上偏置项
+            out = out + self.shift.float()  
         
         return out.to(input_dtype) 
 ```        
 
 ## 2. FeedForward 层
 
-Gemma使用 **GeGLU**，即一种门控线性单元变体。公式为：
-$$
-\text{output} = \text{FC3}\left( \text{GELU}(\text{FC1}(x)) \odot \text{FC2}(x) \right)
-$$（其中 `⊙` 是逐元素乘法）。
-    
-输入 `x` 同时通过两个不同的线性层 (`fc1` 和 `fc2`)。fc1的输出经过 **GELU** 激活函数，产生一个"内容"或"值"。`fc2` 的输出作为一个"门"，控制哪些信息可以通过。 两者进行**逐元素相乘**，实现精细的信息流控制。门控后的结果通过 `fc3` 投影回原始嵌入维度。
-GELU激活函数公式为：
-$$
-\text{GELU}(x) = x \cdot \Phi(x) = x \cdot \frac{1}{2} \left[1 + \text{erf}\left(\frac{x}{\sqrt{2}}\right)\right]
-$$其中：$\Phi(x)$为标准正态分布的累积分布函数（CDF），$\text{erf}$为 误差函数（error function），$x$为输入值。
+Gemma 使用 **GeGLU**，即一种门控线性单元变体。公式为：
+
+`output = FC3( GELU( FC1(x) ) ⊙ FC2(x) )`
+
+（其中 `⊙` 是逐元素乘法）。
+
+输入 `x` 同时通过两个不同的线性层 (`fc1` 和 `fc2`)。fc1 的输出经过 **GELU** 激活函数，产生一个"内容"或"值"。`fc2` 的输出作为一个"门"，控制哪些信息可以通过。两者进行**逐元素相乘**，实现精细的信息流控制。门控后的结果通过 `fc3` 投影回原始嵌入维度。
+
+GELU 激活函数公式为：
+
+`GELU(x) = x ⋅ Φ(x) = x ⋅ 0.5 * [1 + erf(x / √2)]`
+
+其中：Φ(x) 为标准正态分布的累积分布函数（CDF），`erf` 为误差函数（error function），`x` 为输入值。
+
 由于 GELU 的精确计算（涉及误差函数 `erf`）在计算上相对昂贵，一般使用高度精确的近似公式，该公式使用双曲正切函数 `tanh`。
-$$
-\text{GELU}(x) \approx 0.5x \left( 1 + \tanh\left( \sqrt{\frac{2}{\pi}} \left( x + 0.044715x^3 \right) \right) \right)
-$$
+
+`GELU(x) ≈ 0.5 * x * ( 1 + tanh( √(2/π) * ( x + 0.044715 * x^3 ) ) )`
+
 GELU可以理解为：根据输入值的大小，以一定的概率来决定让多少信息通过。
 对于大的正输入：`tanh(...) ≈ 1`，因此 `GELU(x) ≈ 0.5x * (1 + 1) = x`。信息几乎完全通过。
        对于大的负输入：`tanh(...) ≈ -1`，因此 `GELU(x) ≈ 0.5x * (1 - 1) = 0`。信息几乎被完全抑制。
@@ -105,11 +101,11 @@ class FeedForward(nn.Module):
 ```python
 def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
     """
-    预计算旋转位置编码的复数旋转向量（cis向量）
+    计算旋转位置编码的复数旋转向量（cis向量）
     Args:
-        dim: 特征维度（通常是每个注意力头的维度）
-        end: 最大序列长度（默认32K）
-        theta: 旋转角度的基数，控制波长分布（默认10000.0）
+        dim: 特征维度
+        end: 最大序列长度
+        theta: 旋转角度的基数，控制波长分布
     Returns:
         pos_cis: 复数张量，形状为 [end, dim//2]，包含所有位置的角度信息
     """
@@ -119,7 +115,7 @@ def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
     # 生成位置序列 [0, 1, 2, ..., end-1]
     t = torch.arange(end, device=freqs.device)  
     
-    # 计算外积：每个位置t乘以每个频率f，得到角度矩阵 [end, dim//2]
+    # 每个位置t乘以每个频率f，形状为[end, dim//2]
     freqs = torch.outer(t, freqs).float() 
     
     # 将角度转换为复数形式：cis(θ) = cos(θ) + i*sin(θ) = e^(iθ)
@@ -181,31 +177,28 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = head_dim    # 每个头的维度
         self.d_out = num_heads * head_dim  # 输出维度
 
-        # 线性投影层
         self.W_query = nn.Linear(d_in, self.d_out, bias=False, dtype=dtype)  
         self.W_key = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)   
         self.W_value = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype) 
 
         self.out_proj = nn.Linear(self.d_out, d_in, bias=False, dtype=dtype)  
 
-        # 可选的查询和键归一化
         if qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=1e-6) 
             self.k_norm = RMSNorm(head_dim, eps=1e-6) 
         else:
             self.q_norm = self.k_norm = None
 
-        # 注意力分数缩放因子
         if query_pre_attn_scalar is not None:
-            self.scaling = (query_pre_attn_scalar) ** -0.5  # 使用自定义缩放
+            self.scaling = (query_pre_attn_scalar) ** -0.5  
         else:
-            self.scaling = (head_dim) ** -0.5  # 默认使用head_dim的平方根倒数
+            self.scaling = (head_dim) ** -0.5 
 
     def _prepare_grouped_kv(self, keys, values):
         """
         将KV头扩展到与查询头相同的数量
-        keys: (batch_size, seq_len, num_kv_groups, head_dim)  # 注意形状变化
-        values: (batch_size, seq_len, num_kv_groups, head_dim)  # 注意形状变化
+        keys: (batch_size, seq_len, num_kv_groups, head_dim)  
+        values: (batch_size, seq_len, num_kv_groups, head_dim)  
         返回: 扩展后的keys和values, shape: (batch_size, num_heads, seq_len, head_dim)
         """
         # 先转置为 [batch_size, num_kv_groups, seq_len, head_dim]
@@ -221,12 +214,8 @@ class GroupedQueryAttention(nn.Module):
 
     def _compute_attention(self, queries, keys, values, mask):
         """
-        计算注意力机制
-        queries: (batch_size, num_heads, seq_len, head_dim)
-        keys: (batch_size, num_heads, seq_len, head_dim)  
-        values: (batch_size, num_heads, seq_len, head_dim)
-        mask: 注意力掩码
-        返回: 注意力上下文向量, shape: (batch_size, num_heads, seq_len, head_dim)
+        计算注意力机制,输入shape：(batch_size, num_heads, seq_len, head_dim)
+        返回注意力上下文向量, shape: (batch_size, num_heads, seq_len, head_dim)
         """
         queries = queries * self.scaling
         
@@ -246,17 +235,14 @@ class GroupedQueryAttention(nn.Module):
     def forward(self, x, mask, pos_cis):
         b, num_tokens, _ = x.shape
     
-        # 应用投影层获取查询、键、值
-        queries = self.W_query(x)  # (b, num_tokens, num_heads * head_dim)
-        keys = self.W_key(x)       # (b, num_tokens, num_kv_groups * head_dim)
-        values = self.W_value(x)   # (b, num_tokens, num_kv_groups * head_dim)
+        queries = self.W_query(x)  # (batch_size,  seq_len, num_heads * head_dim)
+        keys = self.W_key(x)       # (batch_size,  seq_len, num_kv_groups * head_dim)
+        values = self.W_value(x)   # (batch_size,  seq_len, num_kv_groups * head_dim)
     
-        # 重塑张量维度 - 保持 [batch, seq_len, num_heads, dim] 形状
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim) 
         keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim) 
         values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim) 
     
-        # 可选的查询和键归一化
         if self.q_norm:
             queries = self.q_norm(queries)
         if self.k_norm:
@@ -265,14 +251,14 @@ class GroupedQueryAttention(nn.Module):
         current_pos_cis = pos_cis[:num_tokens]
         queries = apply_rotary_emb(queries, current_pos_cis)
         keys = apply_rotary_emb(keys, current_pos_cis)
-        # 应用旋转位置编码（RoPE）- 输入形状为 [batch, seq_len, num_heads, dim]
+        # 应用旋转位置编码（RoPE）- 输入形状为 [batch_size, seq_len, num_heads, dim]
     
         # 扩展K和V以匹配查询头数量
-        keys, values = self._prepare_grouped_kv(keys, values)  # (b, num_heads, num_tokens, head_dim)
+        keys, values = self._prepare_grouped_kv(keys, values)  # (batch_size, num_heads, seq_len, head_dim)
     
-        context = self._compute_attention(queries, keys, values, mask)  # (b, num_heads, num_tokens, head_dim)
+        context = self._compute_attention(queries, keys, values, mask)  # (batch_size, num_heads, seq_len, head_dim)
     
-        context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)  # (b, num_tokens, d_out)
+        context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)  # (batch_size, seq_len, d_out)
         return self.out_proj(context)
 ```
 ### 3.3 滑动窗口自注意力（Sliding Window Self-Attention）
@@ -283,48 +269,48 @@ class GroupedQueryAttention(nn.Module):
 右边则是滑动窗口自注意力的attention mask，这里的窗口大小为3。包括自己在内，每个位置只能往前看3个输入。
 mask代码实现如下：
 ``` python
-ones = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
-    
-        # mask_global (future is masked: j > i)
-        #     j:  0 1 2 3 4 5 6 7
-        #  i
-        #     0:  0 1 1 1 1 1 1 1
-        #     1:  0 0 1 1 1 1 1 1
-        #     2:  0 0 0 1 1 1 1 1
-        #     3:  0 0 0 0 1 1 1 1
-        #     4:  0 0 0 0 0 1 1 1
-        #     5:  0 0 0 0 0 0 1 1
-        #     6:  0 0 0 0 0 0 0 1
-        #     7:  0 0 0 0 0 0 0 0
-mask_global = torch.triu(ones, diagonal=1)
-    
-        # far_past (too far back is masked: i - j >= sliding_window)
-        # where sliding_window = 4
-        #     j:  0 1 2 3 4 5 6 7
-        #  i
-        #     0:  0 0 0 0 0 0 0 0
-        #     1:  0 0 0 0 0 0 0 0
-        #     2:  0 0 0 0 0 0 0 0
-        #     3:  0 0 0 0 0 0 0 0
-        #     4:  1 0 0 0 0 0 0 0
-        #     5:  1 1 0 0 0 0 0 0
-        #     6:  1 1 1 0 0 0 0 0
-        #     7:  1 1 1 1 0 0 0 0
+ones = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)#创建形状为(seq_len, seq_len)的全True矩阵
+
+mask_global = torch.triu(ones, diagonal=1)       
+# 防止看到未来的信息（标准因果掩码）,即对于位置i，只能看到位置j ≤ i的信息（不能看到j > i的未来信息）
+#     j:  0 1 2 3 4 5 6 7
+#  i
+#     0:  0 1 1 1 1 1 1 1
+#     1:  0 0 1 1 1 1 1 1
+#     2:  0 0 0 1 1 1 1 1
+#     3:  0 0 0 0 1 1 1 1
+#     4:  0 0 0 0 0 1 1 1
+#     5:  0 0 0 0 0 0 1 1
+#     6:  0 0 0 0 0 0 0 1
+#     7:  0 0 0 0 0 0 0 0
+
 far_past = torch.triu(ones, diagonal=self.cfg["sliding_window"]).T
-    
-        # Local (sliding_window) = future OR far-past
-        # mask_local
-        #     j:  0 1 2 3 4 5 6 7
-        # i
-        # 0:      0 1 1 1 1 1 1 1
-        # 1:      0 0 1 1 1 1 1 1
-        # 2:      0 0 0 1 1 1 1 1
-        # 3:      0 0 0 0 1 1 1 1
-        # 4:      1 0 0 0 0 1 1 1
-        # 5:      1 1 0 0 0 0 1 1
-        # 6:      1 1 1 0 0 0 0 1
-        # 7:      1 1 1 1 0 0 0 0
- mask_local = mask_global | far_past
+# 防止看到太遥远的过去信息（滑动窗口限制）,即对于位置i，不能看到位置j ≤ i - sliding_window的太遥远信息
+# 当 sliding_window = 4 时
+#     j:  0 1 2 3 4 5 6 7
+#  i
+#     0:  0 0 0 0 0 0 0 0
+#     1:  0 0 0 0 0 0 0 0
+#     2:  0 0 0 0 0 0 0 0
+#     3:  0 0 0 0 0 0 0 0
+#     4:  1 0 0 0 0 0 0 0
+#     5:  1 1 0 0 0 0 0 0
+#     6:  1 1 1 0 0 0 0 0
+#     7:  1 1 1 1 0 0 0 0
+
+mask_local = mask_global | far_past
+# 每个位置只能看到有限的上下文窗口
+# 当 sliding_window = 4 时, 滑动窗口掩码状态为
+#     j:  0 1 2 3 4 5 6 7
+# i
+# 0:      0 1 1 1 1 1 1 1
+# 1:      0 0 1 1 1 1 1 1
+# 2:      0 0 0 1 1 1 1 1
+# 3:      0 0 0 0 1 1 1 1
+# 4:      1 0 0 0 0 1 1 1
+# 5:      1 1 0 0 0 0 1 1
+# 6:      1 1 1 0 0 0 0 1
+# 7:      1 1 1 1 0 0 0 0
   ```
 通过合理配置局部层和全局层的比例，这种混合架构实现了计算成本与性能的最佳平衡：在不显著增加计算成本的前提下，有效扩展上下文处理长度，将 KV 缓存内存开销从约 60% 大幅降低至不足 15%（基于 32K 上下文的测算结果）。
 
@@ -360,83 +346,106 @@ class TransformerBlock(nn.Module):
         x,
         mask_global,
         mask_local,
-        pos_cis_global,  # 修改参数名：从 cos_global/sin_global 改为 pos_cis_global
-        pos_cis_local,   # 修改参数名：从 cos_local/sin_local 改为 pos_cis_local
+        pos_cis_global,  
+        pos_cis_local,  
     ):
-        # Shortcut connection for attention block
+        # 残差连接：保存输入用于后续相加
         shortcut = x
         x = self.input_layernorm(x)
-
+        # 根据注意力类型选择不同的掩码和位置编码
         if self.attn_type == "sliding_attention":
             attn_mask = mask_local
-            pos_cis = pos_cis_local  # 使用复数旋转编码
+            pos_cis = pos_cis_local  
         else:
             attn_mask = mask_global
-            pos_cis = pos_cis_global  # 使用复数旋转编码
-        
-        # 修改这里：只传递一个pos_cis参数
+            pos_cis = pos_cis_global  
+        # 计算自注意力
         x_attn = self.att(x, attn_mask, pos_cis)
         x_attn = self.post_attention_layernorm(x_attn)
+        # 残差连接：原始输入 + 注意力输出
         x = shortcut + x_attn
 
-        # Shortcut connection for feed forward block
+        # 再次使用残差连接
         shortcut = x
+        # 前馈网络前的归一化
         x_ffn = self.pre_feedforward_layernorm(x)
+        # 通过前馈网络（两个线性层+激活函数）
         x_ffn = self.ff(x_ffn)
+         # 前馈网络输出归一化
         x_ffn = self.post_feedforward_layernorm(x_ffn)
+        # 残差连接：注意力输出 + 前馈网络输出
         x = shortcut + x_ffn
         return x
 
 class Gemma3Model(nn.Module):
+    
     def __init__(self, cfg):
         super().__init__()
+        # 确保每层都有指定的注意力类型
         assert cfg["layer_types"] is not None and len(cfg["layer_types"]) == cfg["n_layers"]
         
-        # Main model parameters
+        # 词嵌入层：将token索引转换为向量
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
-
+        
+        # Transformer块堆叠：构建深层网络
         self.blocks = nn.ModuleList([
             TransformerBlock(cfg, attn_type) for attn_type in cfg["layer_types"]
         ])
-
+        
+        # 最终归一化层和输出头
         self.final_norm = RMSNorm(cfg["emb_dim"], eps=1e-6)
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
-        self.cfg = cfg
+        
+        self.cfg = cfg  # 保存配置
 
-        # Reusable utilities - 使用新的precompute_pos_cis函数
+        # 局部位置编码（用于滑动窗口注意力）
         pos_cis_local = precompute_pos_cis(
-            dim=cfg["head_dim"],
-            end=cfg["context_length"],
-            theta=cfg["rope_local_base"],
+            dim=cfg["head_dim"],           # 每个头的维度
+            end=cfg["context_length"],     # 最大上下文长度
+            theta=cfg["rope_local_base"],  # RoPE的theta参数（局部）
         )
+        
+        # 全局位置编码（用于全局注意力）
         pos_cis_global = precompute_pos_cis(
             dim=cfg["head_dim"],
             end=cfg["context_length"],
-            theta=cfg["rope_base"],
+            theta=cfg["rope_base"],        # RoPE的theta参数（全局）
         )
         
-        # 注册为buffer，注意复数张量的处理
+        # 注册为buffer（不参与训练但需要保存的参数）
         self.register_buffer("pos_cis_local", pos_cis_local, persistent=False)
         self.register_buffer("pos_cis_global", pos_cis_global, persistent=False)
 
     
     def _create_masks(self, seq_len, device):
+        """创建注意力掩码"""
+        # 创建全True的方阵作为掩码基础
         ones = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
         
+        # 全局掩码：防止看到未来信息（因果掩码）
         mask_global = torch.triu(ones, diagonal=1)
         
+        # 过远过去掩码：防止看到太遥远的过去信息
         far_past = torch.triu(ones, diagonal=self.cfg["sliding_window"]).T
         
+        # 局部掩码：结合因果掩码和滑动窗口限制
         mask_local = mask_global | far_past
+        
         return mask_global, mask_local
     
 
     def forward(self, input_ids):
-        # Forward pass
+        """前向传播"""
+        # 获取输入形状 [batch_size, seq_len]
         b, seq_len = input_ids.shape
-        x = self.tok_emb(input_ids) * (self.cfg["emb_dim"] ** 0.5)
+        
+        # 词嵌入：将token索引转换为向量 [batch_size, seq_len] -> [batch_size, seq_len, emb_dim]
+        x = self.tok_emb(input_ids) * (self.cfg["emb_dim"] ** 0.5)  # 缩放嵌入
+        
+        # 创建注意力掩码
         mask_global, mask_local = self._create_masks(seq_len, x.device)
 
+        # 通过所有Transformer层
         for block in self.blocks:
             x = block(
                 x,
@@ -446,8 +455,12 @@ class Gemma3Model(nn.Module):
                 pos_cis_local=self.pos_cis_local,
             )
 
+        # 最终归一化
         x = self.final_norm(x)
+        
+        #输出投影：转换为词汇表概率分布 [batch_size, seq_len, emb_dim] -> [batch_size, seq_len, vocab_size]
         logits = self.out_head(x.to(self.cfg["dtype"]))
+        
         return logits
  ```
  
@@ -512,7 +525,7 @@ print(f"参数量: {sum(p.numel() for p in model.parameters()):,}")
 ``` python
 参数量: 435,870,336
 ```
-对于词嵌入层 (Token Embedding)：
+对于词嵌入层：
 ```
 262,144 (词汇表) × 640 (嵌入维度) = 167,772,160 参数
 ```
@@ -523,14 +536,12 @@ k投影:   640 × 256  = 163,840  ← MQA模式节省参数
 v投影:   640 × 256  = 163,840
 out投影: 1024 × 640 = 655,360
 归一化:   256 × 2    = 512
-----------------------------------
 每层attention: 1,639,912 参数
 ```
 ```markdown
 第一层: 640 × 2048 = 1,310,720
 第二层: 640 × 2048 = 1,310,720  
 第三层: 2048 × 640 = 1,310,720
-----------------------------------
 每层FFN: 3,932,160 参数
 ```
 ```markdown
@@ -550,6 +561,5 @@ out投影: 1024 × 640 = 655,360
 ```markdown
 传统MHA: 4个独立KV头 → 640 × 1024 × 2 = 1,310,720 参数
 MQA模式: 1个共享KV头 → 640 × 256 × 2  = 327,680 参数
-------------------------
 每层节省:                983,040 参数
 18层总节省:            17,694,720 参数
