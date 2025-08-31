@@ -9,7 +9,7 @@ Gemma3的模型结构如下图所示：
 
 ## 1. 构建 RMS 层
 
-Gemma3 使用 **RMSNorm**（均方根标准化）。LayerNorm 需要计算均值和标准差，计算量较大，且涉及减法操作，可能影响数值稳定性。RMSNorm 省略了均值计算，仅使用 均方根（RMS, Root Mean Square） 归一化：
+Gemma3 使用 **RMSNorm**（均方根标准化）。LayerNorm 需要计算均值和标准差，计算量较大，且涉及减法操作，可能影响数值稳定性。RMSNorm 省略了均值计算，仅使用 均方根（RMS, Root Mean Square） 归一化，其中：
 $rms(x) = \sqrt{ \frac{1}{d} \sum_{i=1}^{d} x_i^2 }$  ，
 $\hat{x} = \frac{x}{rms(x) + \epsilon}$  ，
 $y = \gamma \hat{x}$。
