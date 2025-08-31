@@ -1,9 +1,9 @@
-# Gemma3
+# Gemma3: Google推出的高性能轻量级开源模型
 
 Gemma3 是 Google 推出的轻量级、高性能开源模型，支持多种尺寸（1B、4B、12B 和 27B），专为单 GPU 或 TPU 设计。它基于 Transformer 架构，进行了多项重要改进。本指南将详细介绍如何从零开始实现 Gemma3 模型，包括其核心架构、关键创新点以及完整的实现代码。
 
 Gemma3的模型结构如下图所示：
-![输入图片说明](/imgs/2025-08-24/OgLHsxFtkWxsZPBr.png)
+![输入图片说明](images/Gemma3.jpg)
 
 ---
 
@@ -101,6 +101,7 @@ class FeedForward(nn.Module):
 ### 3.1 旋转位置编码（RoPE）
 
 为了确保模型能够处理超长上下文并保持顺序信息，Gemma3 对全局注意力层中的旋转位置编码（RoPE）进行了优化。具体来说，RoPE   的基频从原本的 10k 增加到 1M。这一调整扩展了位置编码的有效周期，使得模型在处理如 128K    长度的序列时，依然能够精确捕捉到相对位置关系。与此同时，局部注意层保持较低的 RoPE 频率（10k    基频），从而更专注于处理局部区域的精细关系。
+![输入图片说明](images/RoPE.png)
 ```python
 def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
     """
@@ -144,6 +145,7 @@ def apply_rotary_emb(x, pos_cis):
         # 创建广播形状：[1, seq_len, 1, dim] 以便与x [batch_size, seq_len, num_heads, dim] 相乘
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return pos_cis.view(*shape)
+    original_dtype = x.dtype
 
     # 将输入的最后两维重塑为复数形式：[batch, seq_len, num_heads, dim] -> [batch, seq_len, num_heads, dim//2, 2] -> 复数
     x = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
@@ -153,7 +155,7 @@ def apply_rotary_emb(x, pos_cis):
     
     #复数乘法实现旋转 (a+bi) * (cosθ + i*sinθ) = 旋转后的向量
     x_rotated = torch.view_as_real(x * pos_cis).flatten(3)
-	return x_rotated.to(dtype=x.dtype)
+    return x_rotated.to(dtype=original_dtype)
 ```
 
 ### 3.2 分组查询注意力（Grouped Query Attention）
@@ -173,7 +175,7 @@ class GroupedQueryAttention(nn.Module):
         self.group_size = num_heads // num_kv_groups  # 每组共享的查询头数量
 
         if head_dim is None:
-            assert d_in % num_heads == 0, 
+            assert d_in % num_heads == 0, "输入维度必须被头数整除"
             head_dim = d_in // num_heads
 
         self.head_dim = head_dim    # 每个头的维度
@@ -202,14 +204,20 @@ class GroupedQueryAttention(nn.Module):
     def _prepare_grouped_kv(self, keys, values):
         """
         将KV头扩展到与查询头相同的数量
-        keys: (batch_size, num_kv_groups, seq_len, head_dim)
-        values: (batch_size, num_kv_groups, seq_len, head_dim)
+        keys: (batch_size, seq_len, num_kv_groups, head_dim)  # 注意形状变化
+        values: (batch_size, seq_len, num_kv_groups, head_dim)  # 注意形状变化
         返回: 扩展后的keys和values, shape: (batch_size, num_heads, seq_len, head_dim)
         """
+        # 先转置为 [batch_size, num_kv_groups, seq_len, head_dim]
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+        
         # 使用repeat_interleave将每个KV头重复group_size次
         expanded_keys = keys.repeat_interleave(self.group_size, dim=1)
         expanded_values = values.repeat_interleave(self.group_size, dim=1)
         return expanded_keys, expanded_values
+    
+
 
     def _compute_attention(self, queries, keys, values, mask):
         """
@@ -222,6 +230,7 @@ class GroupedQueryAttention(nn.Module):
         """
         queries = queries * self.scaling
         
+        # 计算注意力分数: Q @ K^T
         attn_scores = queries @ keys.transpose(2, 3)
         
         # 应用掩码（将掩码位置设置为负无穷）
@@ -233,48 +242,48 @@ class GroupedQueryAttention(nn.Module):
         # 应用注意力权重到值上: 注意力权重 @ V
         context = attn_weights @ values
         return context
-
-    def forward(self, x, mask, cos, sin):
-        b, num_tokens, _ = x.shape  # 获取batch大小和序列长度
-
+    
+    def forward(self, x, mask, pos_cis):
+        b, num_tokens, _ = x.shape
+    
         # 应用投影层获取查询、键、值
         queries = self.W_query(x)  # (b, num_tokens, num_heads * head_dim)
         keys = self.W_key(x)       # (b, num_tokens, num_kv_groups * head_dim)
         values = self.W_value(x)   # (b, num_tokens, num_kv_groups * head_dim)
-
-        # 重塑张量维度
-        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)  # (b, num_heads, num_tokens, head_dim)
-        keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)    # (b, num_kv_groups, num_tokens, head_dim)
-        values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2) # (b, num_kv_groups, num_tokens, head_dim)
-
+    
+        # 重塑张量维度 - 保持 [batch, seq_len, num_heads, dim] 形状
+        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim) 
+        keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim) 
+        values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim) 
+    
         # 可选的查询和键归一化
         if self.q_norm:
-            queries = self.q_norm(queries)  # 归一化查询
+            queries = self.q_norm(queries)
         if self.k_norm:
-            keys = self.k_norm(keys)        # 归一化键
-
-        # 应用旋转位置编码（RoPE）
-        queries = apply_rope(queries, cos, sin)  # 为查询添加位置信息
-        keys = apply_rope(keys, cos, sin)        # 为键添加位置信息
-
+            keys = self.k_norm(keys)
+            
+        current_pos_cis = pos_cis[:num_tokens]
+        queries = apply_rotary_emb(queries, current_pos_cis)
+        keys = apply_rotary_emb(keys, current_pos_cis)
+        # 应用旋转位置编码（RoPE）- 输入形状为 [batch, seq_len, num_heads, dim]
+    
         # 扩展K和V以匹配查询头数量
         keys, values = self._prepare_grouped_kv(keys, values)  # (b, num_heads, num_tokens, head_dim)
-
+    
         context = self._compute_attention(queries, keys, values, mask)  # (b, num_heads, num_tokens, head_dim)
-
+    
         context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)  # (b, num_tokens, d_out)
-        return self.out_proj(context)  # (b, num_tokens, d_in)
+        return self.out_proj(context)
 ```
 ### 3.3 滑动窗口自注意力（Sliding Window Self-Attention）
 
 为了支持长上下文处理，Gemma3 采用了 **局部-全局注意力层交替** 的混合架构：每 5 个局部层之间插入一个全局层，局部层采用，专门处理局部依赖关系，仅关注固定跨度（如 1024 个 token）范围内的上下文。全局层关注整个上下文范围，捕捉长距离语义依赖。
-![滑动窗口自注意力机制](/imgs/2025-08-24/zGGxardamyUTnntY.png)
+![滑动窗口自注意力机制](images/sliding_windows.png)
 如图所示，左边是正常的causal attention，每个位置能看到自己和前面的位置，attention mask是个下三角矩阵。
 右边则是滑动窗口自注意力的attention mask，这里的窗口大小为3。包括自己在内，每个位置只能往前看3个输入。
 mask代码实现如下：
 ``` python
-def _create_masks(seq_len, device):
-        ones = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
+ones = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
     
         # mask_global (future is masked: j > i)
         #     j:  0 1 2 3 4 5 6 7
@@ -287,7 +296,7 @@ def _create_masks(seq_len, device):
         #     5:  0 0 0 0 0 0 1 1
         #     6:  0 0 0 0 0 0 0 1
         #     7:  0 0 0 0 0 0 0 0
-        mask_global = torch.triu(ones, diagonal=1)
+mask_global = torch.triu(ones, diagonal=1)
     
         # far_past (too far back is masked: i - j >= sliding_window)
         # where sliding_window = 4
@@ -301,7 +310,7 @@ def _create_masks(seq_len, device):
         #     5:  1 1 0 0 0 0 0 0
         #     6:  1 1 1 0 0 0 0 0
         #     7:  1 1 1 1 0 0 0 0
-        far_past = torch.triu(ones, diagonal=self.cfg["sliding_window"]).T
+far_past = torch.triu(ones, diagonal=self.cfg["sliding_window"]).T
     
         # Local (sliding_window) = future OR far-past
         # mask_local
@@ -315,8 +324,7 @@ def _create_masks(seq_len, device):
         # 5:      1 1 0 0 0 0 1 1
         # 6:      1 1 1 0 0 0 0 1
         # 7:      1 1 1 1 0 0 0 0
-        mask_local = mask_global | far_past
-        return mask_global, mask_local
+ mask_local = mask_global | far_past
   ```
 通过合理配置局部层和全局层的比例，这种混合架构实现了计算成本与性能的最佳平衡：在不显著增加计算成本的前提下，有效扩展上下文处理长度，将 KV 缓存内存开销从约 60% 大幅降低至不足 15%（基于 32K 上下文的测算结果）。
 
@@ -352,10 +360,8 @@ class TransformerBlock(nn.Module):
         x,
         mask_global,
         mask_local,
-        cos_global,
-        sin_global,
-        cos_local,
-        sin_local,
+        pos_cis_global,  # 修改参数名：从 cos_global/sin_global 改为 pos_cis_global
+        pos_cis_local,   # 修改参数名：从 cos_local/sin_local 改为 pos_cis_local
     ):
         # Shortcut connection for attention block
         shortcut = x
@@ -363,14 +369,13 @@ class TransformerBlock(nn.Module):
 
         if self.attn_type == "sliding_attention":
             attn_mask = mask_local
-            cos = cos_local
-            sin = sin_local
+            pos_cis = pos_cis_local  # 使用复数旋转编码
         else:
             attn_mask = mask_global
-            cos = cos_global
-            sin = sin_global
+            pos_cis = pos_cis_global  # 使用复数旋转编码
         
-        x_attn = self.att(x, attn_mask, cos, sin)
+        # 修改这里：只传递一个pos_cis参数
+        x_attn = self.att(x, attn_mask, pos_cis)
         x_attn = self.post_attention_layernorm(x_attn)
         x = shortcut + x_attn
 
@@ -391,30 +396,40 @@ class Gemma3Model(nn.Module):
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
         self.blocks = nn.ModuleList([
-            TransformerBlock(cfg, attn_type)for attn_type in cfg["layer_types"]
+            TransformerBlock(cfg, attn_type) for attn_type in cfg["layer_types"]
         ])
 
         self.final_norm = RMSNorm(cfg["emb_dim"], eps=1e-6)
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
         self.cfg = cfg
 
-        # Reusable utilities    
-        cos_local, sin_local = compute_rope_params(
-            head_dim=cfg["head_dim"],
-            theta_base=cfg["rope_local_base"],
-            context_length=cfg["context_length"],
-            dtype=torch.float32,
+        # Reusable utilities - 使用新的precompute_pos_cis函数
+        pos_cis_local = precompute_pos_cis(
+            dim=cfg["head_dim"],
+            end=cfg["context_length"],
+            theta=cfg["rope_local_base"],
         )
-        cos_global, sin_global = compute_rope_params(
-            head_dim=cfg["head_dim"],
-            theta_base=cfg["rope_base"],
-            context_length=cfg["context_length"],
-            dtype=torch.float32,
+        pos_cis_global = precompute_pos_cis(
+            dim=cfg["head_dim"],
+            end=cfg["context_length"],
+            theta=cfg["rope_base"],
         )
-        self.register_buffer("cos_local", cos_local, persistent=False)
-        self.register_buffer("sin_local", sin_local, persistent=False)
-        self.register_buffer("cos_global", cos_global, persistent=False)
-        self.register_buffer("sin_global", sin_global, persistent=False)
+        
+        # 注册为buffer，注意复数张量的处理
+        self.register_buffer("pos_cis_local", pos_cis_local, persistent=False)
+        self.register_buffer("pos_cis_global", pos_cis_global, persistent=False)
+
+    
+    def _create_masks(self, seq_len, device):
+        ones = torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
+        
+        mask_global = torch.triu(ones, diagonal=1)
+        
+        far_past = torch.triu(ones, diagonal=self.cfg["sliding_window"]).T
+        
+        mask_local = mask_global | far_past
+        return mask_global, mask_local
+    
 
     def forward(self, input_ids):
         # Forward pass
@@ -427,13 +442,114 @@ class Gemma3Model(nn.Module):
                 x,
                 mask_global=mask_global,
                 mask_local=mask_local,
-                cos_global=self.cos_global,
-                sin_global=self.sin_global,
-                cos_local=self.cos_local,
-                sin_local=self.sin_local,
+                pos_cis_global=self.pos_cis_global,
+                pos_cis_local=self.pos_cis_local,
             )
 
         x = self.final_norm(x)
         logits = self.out_head(x.to(self.cfg["dtype"]))
         return logits
  ```
+ 
+我们可以用以下代码进行模型的简单计算
+``` python
+#定义模型配置（270M参数版本）
+GEMMA3_CONFIG_270M = {
+    "vocab_size": 262_144,
+    "context_length": 32_768,
+    "emb_dim": 640,
+    "n_heads": 4,
+    "n_layers": 18,
+    "hidden_dim": 2048,
+    "head_dim": 256,
+    "qk_norm": True,
+    "n_kv_groups": 1,
+    "rope_local_base": 10_000.0,
+    "rope_base": 1_000_000.0,
+    "sliding_window": 512,
+    "layer_types": [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention"
+    ],
+    "dtype": torch.bfloat16,
+    "query_pre_attn_scalar": 256,
+}
+torch.manual_seed(123)
+model = Gemma3Model(GEMMA3_CONFIG_270M)
+print(model(torch.tensor([1, 2, 3, 4]).unsqueeze(0)))
+print(model(torch.tensor([1, 2, 3, 4]).unsqueeze(0)).shape)
+```
+结果为：
+```python
+tensor([[[ 0.7500,  0.1060,  0.4844,  ...,  0.9414,  0.3984, -0.2324],
+         [-0.3691, -0.1001,  0.8984,  ..., -0.2812,  0.4785,  0.8125],
+         [-0.2285, -0.2578,  0.4082,  ...,  0.8008, -0.8672,  1.0625],
+         [ 0.7109,  0.9336, -0.7852,  ..., -0.9844, -1.2500,  0.0649]]],
+       dtype=torch.bfloat16, grad_fn=<UnsafeViewBackward0>)
+torch.Size([1, 4, 262144])
+```
+模型参数总量为词嵌入层，Transformer层，输出层参数量相加。可以使用以下代码查看model中参数总数：
+``` python
+print(f"参数量: {sum(p.numel() for p in model.parameters()):,}")
+```
+结果为
+``` python
+参数量: 435,870,336
+```
+对于词嵌入层 (Token Embedding)：
+```
+262,144 (词汇表) × 640 (嵌入维度) = 167,772,160 参数
+```
+本文设置模型有18个Transformer层，每层参数量由attention计算，前馈网络层和layernorm层所需参数组成。对于transformer层：
+```markdown
+q投影: 640 × 1024 = 655,360  
+k投影:   640 × 256  = 163,840  ← MQA模式节省参数
+v投影:   640 × 256  = 163,840
+out投影: 1024 × 640 = 655,360
+归一化:   256 × 2    = 512
+----------------------------------
+每层attention: 1,639,912 参数
+```
+```markdown
+第一层: 640 × 2048 = 1,310,720
+第二层: 640 × 2048 = 1,310,720  
+第三层: 2048 × 640 = 1,310,720
+----------------------------------
+每层FFN: 3,932,160 参数
+```
+```markdown
+4 × RMSNorm(640) = 2,560 参数
+```
+单层Transformer总计参数量为1,639,912+3,932,160+2560= 5,574,632。
+18个Transformer层共有5,574,632 × 18 = 100,343,376 参数
+
+ 对于输出层：
+```
+640 × 262,144 = 167,772,160 参数
+```
+最终模型参数量为167,772,160+100,343,376  +167,772,160
+= 435,870,336
+
+可以注意到Gemma3用了Multi-Query Attention (MQA)，该方法能够减少大模型参数量，在基本保持性能的前提下提高推理速度。
+```markdown
+传统MHA: 4个独立KV头 → 640 × 1024 × 2 = 1,310,720 参数
+MQA模式: 1个共享KV头 → 640 × 256 × 2  = 327,680 参数
+------------------------
+每层节省:                983,040 参数
+18层总节省:            17,694,720 参数
