@@ -563,3 +563,13 @@ out投影: 1024 × 640 = 655,360
 MQA模式: 1个共享KV头 → 640 × 256 × 2  = 327,680 参数
 每层节省:                983,040 参数
 18层总节省:            17,694,720 参数
+```
+可用以下代码查看模型每层参数：
+```python
+for name, param in model.named_parameters():
+    print(f"Name: {name}")
+    print(f"Shape: {param.shape}")
+    print(f"Values: {param}")
+    print("---")
+```
+
