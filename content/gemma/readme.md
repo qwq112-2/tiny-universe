@@ -255,7 +255,7 @@ class GroupedQueryAttention(nn.Module):
     
         # 扩展K和V以匹配查询头数量
         keys, values = self._prepare_grouped_kv(keys, values)  # (batch_size, num_heads, seq_len, head_dim)
-    
+        queries = queries.transpose(1, 2)
         context = self._compute_attention(queries, keys, values, mask)  # (batch_size, num_heads, seq_len, head_dim)
     
         context = context.transpose(1, 2).reshape(b, num_tokens, self.d_out)  # (batch_size, seq_len, d_out)
